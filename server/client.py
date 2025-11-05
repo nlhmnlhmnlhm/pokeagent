@@ -11,6 +11,9 @@ import io
 import requests
 from PIL import Image
 
+import threading
+import queue
+
 # Display-related imports (conditionally used)
 try:
     import pygame
@@ -42,9 +45,9 @@ def update_display_with_status(screen, font, mode, step_count, additional_info="
         # Display the frame
         scaled_surface = pygame.transform.scale(frame_surface, (480, 320))
         screen.blit(scaled_surface, (0, 0))
-    else:
-        # Fill with black if no frame
-        screen.fill((0, 0, 0))
+    # else:
+    #     # Fill with black if no frame
+    #     screen.fill((0, 0, 0))
     
     # Create status text
     status_text = f"{mode} | Steps: {step_count}"
@@ -90,8 +93,11 @@ def run_multiprocess_client(server_port=8000, args=None):
     else:
         mode = "AGENT"
     
-    last_agent_time = time.time()
+    last_agent_time = time.time() + 5.0
     step_count = 0
+
+    agent_thinking = False
+    agent_result_queue = queue.Queue()
     
     # Initialize pygame if not headless
     if not headless and PYGAME_AVAILABLE:
@@ -299,8 +305,9 @@ def run_multiprocess_client(server_port=8000, args=None):
                                     print(f"🎮 Manual: {action} (connection error: {e})")
                 
                 # Update display
+                additional_info = "🤔 Thinking..." if agent_thinking else ""
                 try:
-                    response = requests.get(f"{server_url}/screenshot", timeout=0.5)
+                    response = requests.get(f"{server_url}/screenshot", timeout=0.75)
                     if response.status_code == 200:
                         frame_data = response.json().get("screenshot_base64", "")
                         if frame_data:
@@ -317,23 +324,36 @@ def run_multiprocess_client(server_port=8000, args=None):
                     update_display_with_status(screen, font, mode, step_count, f"Error: {str(e)[:30]}")
                 
                 clock.tick(30)  # 30 FPS for display
-            
+
             # Auto agent processing (both headless and display modes)
             if mode == "AUTO":
                 current_time = time.time()
-                if current_time - last_agent_time > 3.0:  # Every 3 seconds
+                if current_time - last_agent_time > 4.0 and not agent_thinking:  # Every 3 seconds 
                     # Check if action queue is ready
                     try:
-                        queue_response = requests.get(f"{server_url}/queue_status", timeout=1)
+                        queue_response = requests.get(f"{server_url}/queue_status", timeout=0.5)
                         if queue_response.status_code == 200:
                             queue_status = queue_response.json()
                             if queue_status.get("queue_empty", False):
-                                # Get state and process
-                                response = requests.get(f"{server_url}/state", timeout=5)
-                                if response.status_code == 200:
-                                    state_data = response.json()
-                                    screenshot_base64 = state_data.get("visual", {}).get("screenshot_base64", "")
-                                    if screenshot_base64:
+                                agent_thinking = True
+                                print("🤔 Agent is thinking...")
+
+                                # Run agent step in background thread
+                                def agent_thread_func(current_step_count, thread_start_time):
+                                    # Make sure to modify the variables from the outer scope
+                                    nonlocal agent_thinking, step_count, last_agent_time 
+                                    
+                                    try:
+                                        # 1. Get state
+                                        response = requests.get(f"{server_url}/state", timeout=5)
+                                        if response.status_code != 200:
+                                            raise Exception(f"Failed to get state: {response.status_code}")
+
+                                        state_data = response.json()
+                                        screenshot_base64 = state_data.get("visual", {}).get("screenshot_base64", "")
+                                        if not screenshot_base64:
+                                            raise Exception("No screenshot in state data")
+                                        
                                         img_data = base64.b64decode(screenshot_base64)
                                         screenshot = Image.open(io.BytesIO(img_data))
                                         
@@ -349,75 +369,109 @@ def run_multiprocess_client(server_port=8000, args=None):
                                             'action_queue_length': state_data.get('action_queue_length', 0)
                                         }
                                         
+                                        # 2. Run Agent (Slow VLM call)
                                         result = agent.step(game_state)
+                                        
+                                        # 3. Process Result (All blocking calls are now in this thread)
                                         if result and result.get('action'):
-                                            # Convert action to buttons list format expected by server
                                             action = result['action']
                                             if isinstance(action, list):
-                                                buttons = action  # Already a list of buttons
+                                                buttons = action
                                             else:
-                                                # Single action string, convert to list
                                                 buttons = action.split(',') if ',' in action else [action]
                                                 buttons = [btn.strip() for btn in buttons]
                                             
+                                            # 3a. Send Action
+                                            response = requests.post(
+                                                f"{server_url}/action",
+                                                json={"buttons": buttons},
+                                                timeout=5
+                                            )
+                                            if response.status_code != 200:
+                                                raise Exception(f"Server error on action: {response.status_code}")
+
+                                            # Action was successful, now update state for main thread
+                                            new_step_count = current_step_count + 1
+                                            new_agent_time = time.time()
+                                            
+                                            # Put final result on queue for main thread
+                                            agent_result_queue.put(('success', result, new_step_count, new_agent_time))
+
+                                            # 3b. Sync and Checkpoint (Still in background thread)
                                             try:
-                                                response = requests.post(
-                                                    f"{server_url}/action",
-                                                    json={"buttons": buttons},
+                                                from utils.llm_logger import get_llm_logger
+                                                client_llm_logger = get_llm_logger()
+                                                if client_llm_logger:
+                                                    sync_response = requests.post(
+                                                        f"{server_url}/sync_llm_metrics",
+                                                        json={"cumulative_metrics": client_llm_logger.cumulative_metrics},
+                                                        timeout=5
+                                                    )
+                                                    if sync_response.status_code == 200:
+                                                        if new_step_count % 10 == 0:
+                                                            print(f"🔄 LLM metrics synced to server")
+                                            except Exception as e:
+                                                print(f"⚠️ LLM metrics sync error: {e}")
+                                            
+                                            try:
+                                                checkpoint_response = requests.post(
+                                                    f"{server_url}/checkpoint",
+                                                    json={"step_count": new_step_count},
+                                                    timeout=10  # This 10s block is now safely in the background
+                                                )
+                                                
+                                                history_response = requests.post(
+                                                    f"{server_url}/save_agent_history",
                                                     timeout=5
                                                 )
-                                                if response.status_code == 200:
-                                                    step_count += 1
-                                                    print(f"🎮 Agent: {action} (sent successfully)")
-                                                    print(f"🎮 Step {step_count}: {result['action']}")
-                                                    last_agent_time = current_time
-                                                    
-                                                    # Auto-save checkpoint after each step for persistence
-                                                    try:
-                                                        # Sync client's LLM metrics to server before saving checkpoint
-                                                        try:
-                                                            from utils.llm_logger import get_llm_logger
-                                                            client_llm_logger = get_llm_logger()
-                                                            if client_llm_logger:
-                                                                sync_response = requests.post(
-                                                                    f"{server_url}/sync_llm_metrics",
-                                                                    json={"cumulative_metrics": client_llm_logger.cumulative_metrics},
-                                                                    timeout=5
-                                                                )
-                                                                if sync_response.status_code == 200:
-                                                                    if step_count % 10 == 0:  # Log every 10 steps to avoid spam
-                                                                        print(f"🔄 LLM metrics synced to server")
-                                                        except Exception as e:
-                                                            print(f"⚠️ LLM metrics sync error: {e}")
-                                                        
-                                                        # Save game state checkpoint
-                                                        checkpoint_response = requests.post(
-                                                            f"{server_url}/checkpoint",
-                                                            json={"step_count": step_count},
-                                                            timeout=10
-                                                        )
-                                                        
-                                                        # Save agent history to checkpoint_llm.txt
-                                                        history_response = requests.post(
-                                                            f"{server_url}/save_agent_history",
-                                                            timeout=5
-                                                        )
-                                                        
-                                                        if checkpoint_response.status_code == 200 and history_response.status_code == 200:
-                                                            if step_count % 10 == 0:  # Log every 10 steps to avoid spam
-                                                                print(f"💾 Checkpoint and history saved at step {step_count}")
-                                                        else:
-                                                            print(f"⚠️ Save failed - Checkpoint: {checkpoint_response.status_code}, History: {history_response.status_code}")
-                                                    except requests.exceptions.RequestException as e:
-                                                        print(f"⚠️ Checkpoint/history save error: {e}")
+                                                
+                                                if checkpoint_response.status_code == 200 and history_response.status_code == 200:
+                                                    if new_step_count % 10 == 0:
+                                                        print(f"💾 Checkpoint and history saved at step {new_step_count}")
                                                 else:
-                                                    print(f"🎮 Agent: {action} (server error: {response.status_code})")
+                                                    print(f"⚠️ Save failed - Checkpoint: {checkpoint_response.status_code}, History: {history_response.status_code}")
                                             except requests.exceptions.RequestException as e:
-                                                print(f"🎮 Agent: {action} (connection error: {e})")
+                                                print(f"⚠️ Checkpoint/history save error: {e}")
+                                        
+                                        else:
+                                            # Agent returned no action
+                                            agent_result_queue.put(('no_action', None, current_step_count, thread_start_time))
+                                            
+                                    except Exception as e:
+                                        agent_result_queue.put(('error', e, current_step_count, thread_start_time))
+                                    finally:
+                                        agent_thinking = False
+                                
+                                # Pass current_step_count and current_time to the thread
+                                thread = threading.Thread(target=agent_thread_func, args=(step_count, current_time))
+                                thread.daemon = True
+                                thread.start()
                     except Exception as e:
                         print(f"❌ AUTO mode error: {e}")
+                try:
+                    # Get the processed result from the background thread
+                    status, data, new_step_count, new_agent_time = agent_result_queue.get_nowait()
+                    
+                    if status == 'success':
+                        result = data
+                        step_count = new_step_count      # Update step_count from thread
+                        last_agent_time = new_agent_time  # Update timer from thread
+                        
+                        print(f"🎮 Agent: {result['action']} (sent successfully)")
+                        print(f"🎮 Step {step_count}: {result['action']}")
+                    
+                    elif status == 'error':
+                        print(f"❌ Agent error: {data}")
                         import traceback
                         traceback.print_exc()
+                        last_agent_time = new_agent_time # Reset timer even on error
+                    
+                    elif status == 'no_action':
+                        print("🤔 Agent returned no action.")
+                        last_agent_time = new_agent_time # Reset timer
+                        
+                except queue.Empty:
+                    pass
             
             # Small sleep to prevent CPU spinning
             if headless:
