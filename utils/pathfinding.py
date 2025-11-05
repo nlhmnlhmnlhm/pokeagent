@@ -9,9 +9,9 @@ import heapq
 import logging
 from typing import List, Tuple, Dict, Optional, Set
 from dataclasses import dataclass, field
+from pokemon_env.enums import MetatileBehavior
 
 logger = logging.getLogger(__name__)
-
 
 @dataclass
 class Node:
@@ -212,8 +212,6 @@ class Pathfinder:
         if 'tiles' not in map_data:
             return True
 
-        tiles = map_data['tiles']
-
         # Get tile at destination
         # Assuming tiles is centered around player
         # Need to convert world coordinates to tile array indices
@@ -222,6 +220,50 @@ class Pathfinder:
 
         # TODO: Implement proper ledge direction checking when we have
         # reliable world-to-tile coordinate mapping
+
+        tiles = map_data.get('tiles', [])
+        map_height = len(tiles)
+        if map_height == 0:
+            return True
+        map_width = len(tiles[0]) if map_height > 0 else 0
+
+        to_x, to_y = to_pos
+        from_x, from_y = from_pos
+
+        # Check if 'to' position is within tile bounds
+        if not (0 <= to_y < map_height and 0 <= to_x < map_width):
+            # This position is out of bounds.
+            # The 'blocked' set should already contain this,
+            # but we return False to be safe.
+            return False
+
+        # Get tile at destination
+        tile = tiles[to_y][to_x]
+
+        if isinstance(tile, tuple) and len(tile) >= 2:
+            # Format: (tile_id, behavior, collision, elevation)
+            behavior = tile[1]
+
+            # Get direction of movement
+            dx = to_x - from_x  # 1 = RIGHT, -1 = LEFT
+            dy = to_y - from_y  # 1 = DOWN, -1 = UP
+
+            # Define ledge behaviors
+            if behavior == MetatileBehavior.JUMP_SOUTH.value: # 59
+                # Can only move SOUTH (dy=1) onto this tile
+                return dy == 1 and dx == 0
+            
+            if behavior == MetatileBehavior.JUMP_NORTH.value: # 58
+                # Can only move NORTH (dy=-1) onto this tile
+                return dy == -1 and dx == 0
+            
+            if behavior == MetatileBehavior.JUMP_EAST.value: # 56
+                # Can only move EAST (dx=1) onto this tile
+                return dx == 1 and dy == 0
+                
+            if behavior == MetatileBehavior.JUMP_WEST.value: # 57
+                # Can only move WEST (dx=-1) onto this tile
+                return dx == -1 and dy == 0
 
         return True
     
@@ -261,7 +303,7 @@ class Pathfinder:
             closed_set.add((current.x, current.y))
             
             # Check all neighbors
-            for neighbor_pos in self._get_neighbors(current, blocked):
+            for neighbor_pos in self._get_neighbors(current, blocked, map_data):
                 if neighbor_pos in closed_set:
                     continue
                 
@@ -282,7 +324,7 @@ class Pathfinder:
         
         return None
     
-    def _get_neighbors(self, node: Node, blocked: Set[Tuple[int, int]]) -> List[Tuple[int, int]]:
+    def _get_neighbors(self, node: Node, blocked: Set[Tuple[int, int]], map_data: Dict) -> List[Tuple[int, int]]:
         """Get valid neighbor positions for a node."""
         neighbors = []
         
@@ -293,10 +335,15 @@ class Pathfinder:
             # Add diagonal directions
             directions.extend([(-1, -1), (1, -1), (-1, 1), (1, 1)])
         
+        from_pos = (node.x, node.y)
+
         for dx, dy in directions:
             new_x, new_y = node.x + dx, node.y + dy
-            if (new_x, new_y) not in blocked:
-                neighbors.append((new_x, new_y))
+            new_pos = (new_x, new_y)
+            
+            if new_pos not in blocked:
+                if self._can_move_to(from_pos, new_pos, map_data):
+                    neighbors.append(new_pos)
         
         return neighbors
     
@@ -341,12 +388,8 @@ class Pathfinder:
             if dist > max_search_distance:
                 break
             
-            # Check all neighbors
-            for dx in [-1, 0, 1]:
-                for dy in [-1, 0, 1]:
-                    if dx == 0 and dy == 0:
-                        continue
-                    
+            # Check all neighbors except diagonals
+                for dx, dy in [(0, -1), (0, 1), (-1, 0), (1, 0)]:
                     new_pos = (pos[0] + dx, pos[1] + dy)
                     
                     if new_pos not in visited:
