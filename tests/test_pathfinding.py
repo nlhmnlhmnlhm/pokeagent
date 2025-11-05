@@ -1,4 +1,4 @@
-import pathfinding
+import utils.pathfinding as pathfinding
 import copy
 import logging
 import sys
