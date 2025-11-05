@@ -1,9 +1,10 @@
 ## Pokéagent 
 
 - [x] Run ``--scaffold simple`` and set `trim_padding` to `false`
-- [ ] Fix popup error 
+- [x] Fix popup error 
+- [ ] Fix HTTPConnexionError 
 - [ ] Add a new module feedback loop to inform the agent whether an action succeeded
-- [ ] Add pathfinding 
+- [ ] Add pathfinding to `simple.py`
 - [ ] Add variety to prompts
 
 ### Setup
