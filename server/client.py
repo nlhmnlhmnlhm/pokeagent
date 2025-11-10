@@ -13,6 +13,9 @@ from PIL import Image
 
 import threading
 import queue
+import logging
+
+log = logging.getLogger(__name__)
 
 # Display-related imports (conditionally used)
 try:
@@ -27,6 +30,11 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from agent import Agent
 from utils.state_formatter import format_state_for_llm
+from .screenshot_verifier import ScreenshotVerifier
+
+DEBUG_FOLDER = "debug_screenshots"
+os.makedirs(DEBUG_FOLDER, exist_ok=True)
+log.info(f"Saving debug screenshots on failure to: {DEBUG_FOLDER}/")
 
 
 def update_display_with_status(screen, font, mode, step_count, additional_info="", frame_surface=None):
@@ -78,6 +86,8 @@ def run_multiprocess_client(server_port=8000, args=None):
     agent = Agent(args)
     print(f"✅ Agent initialized")
     print(f"🎮 Client connected to server at {server_url}")
+
+    verifier = ScreenshotVerifier(change_threshold=0.975)
     
     # Display setup
     headless = args and args.headless
@@ -328,8 +338,8 @@ def run_multiprocess_client(server_port=8000, args=None):
             # Auto agent processing (both headless and display modes)
             if mode == "AUTO":
                 current_time = time.time()
-                if current_time - last_agent_time > 4.0 and not agent_thinking:  # Every 3 seconds 
-                    # Check if action queue is ready
+                # <--- MODIFIED: Check queue_empty *and* not thinking
+                if current_time - last_agent_time > 0.1 and not agent_thinking: 
                     try:
                         queue_response = requests.get(f"{server_url}/queue_status", timeout=0.5)
                         if queue_response.status_code == 200:
@@ -343,36 +353,38 @@ def run_multiprocess_client(server_port=8000, args=None):
                                     # Make sure to modify the variables from the outer scope
                                     nonlocal agent_thinking, step_count, last_agent_time 
                                     
+                                    img_before = None 
+                                    game_state_before = None 
+                                    action_to_verify = "WAIT" 
+                                    
                                     try:
-                                        # 1. Get state
-                                        response = requests.get(f"{server_url}/state", timeout=5)
-                                        if response.status_code != 200:
-                                            raise Exception(f"Failed to get state: {response.status_code}")
+                                        # 1. Get state (BEFORE)
+                                        response_before = requests.get(f"{server_url}/state", timeout=5) 
+                                        if response_before.status_code != 200:
+                                            raise Exception(f"Failed to get state: {response_before.status_code}")
 
-                                        state_data = response.json()
-                                        screenshot_base64 = state_data.get("visual", {}).get("screenshot_base64", "")
-                                        if not screenshot_base64:
-                                            raise Exception("No screenshot in state data")
+                                        state_data_before = response_before.json() 
+                                        screenshot_base64_before = state_data_before.get("visual", {}).get("screenshot_base64", "")
+                                        if not screenshot_base64_before:
+                                            raise Exception("No screenshot in 'before' state data")
                                         
-                                        img_data = base64.b64decode(screenshot_base64)
-                                        screenshot = Image.open(io.BytesIO(img_data))
+                                        img_data_before = base64.b64decode(screenshot_base64_before) 
+                                        img_before = Image.open(io.BytesIO(img_data_before)) 
                                         
-                                        game_state = {
-                                            'frame': screenshot,
-                                            'player': state_data.get('player', {}),
-                                            'game': state_data.get('game', {}),
-                                            'map': state_data.get('map', {}),
-                                            'milestones': state_data.get('milestones', {}),
-                                            'visual': state_data.get('visual', {}),
-                                            'step_number': state_data.get('step_number', 0),
-                                            'status': state_data.get('status', ''),
-                                            'action_queue_length': state_data.get('action_queue_length', 0)
+                                        game_state_before = { 
+                                            'frame': img_before,
+                                            'player': state_data_before.get('player', {}),
+                                            'game': state_data_before.get('game', {}),
+                                            'map': state_data_before.get('map', {}),
+                                            'milestones': state_data_before.get('milestones', {}),
+                                            'visual': state_data_before.get('visual', {}),
+                                            'step_number': state_data_before.get('step_number', 0),
+                                            'status': state_data_before.get('status', ''),
+                                            'action_queue_length': state_data_before.get('action_queue_length', 0)
                                         }
                                         
-                                        # 2. Run Agent (Slow VLM call)
-                                        result = agent.step(game_state)
+                                        result = agent.step(game_state_before) 
                                         
-                                        # 3. Process Result (All blocking calls are now in this thread)
                                         if result and result.get('action'):
                                             action = result['action']
                                             if isinstance(action, list):
@@ -381,23 +393,60 @@ def run_multiprocess_client(server_port=8000, args=None):
                                                 buttons = action.split(',') if ',' in action else [action]
                                                 buttons = [btn.strip() for btn in buttons]
                                             
-                                            # 3a. Send Action
+                                            action_to_verify = buttons[0] if buttons else "WAIT"
+                                            
                                             response = requests.post(
                                                 f"{server_url}/action",
                                                 json={"buttons": buttons},
                                                 timeout=5
                                             )
                                             if response.status_code != 200:
-                                                raise Exception(f"Server error on action: {response.status_code}")
+                                                raise Exception(f"Server error on action: {response.status_code}")                                            
+                                            time.sleep(1.0)
+                                            
+                                            img_after = None
+                                            try:
+                                                response_after = requests.get(f"{server_url}/state", timeout=5)
+                                                if response_after.status_code == 200:
+                                                    state_data_after = response_after.json()
+                                                    screenshot_base64_after = state_data_after.get("visual", {}).get("screenshot_base64", "")
+                                                    if screenshot_base64_after:
+                                                        img_data_after = base64.b64decode(screenshot_base64_after)
+                                                        img_after = Image.open(io.BytesIO(img_data_after))
+                                                else:
+                                                    log.warning(f"Verifier: Could not get 'after' state: {response_after.status_code}")
+                                            
+                                            except Exception as e:
+                                                log.warning(f"Verifier: Error getting 'after' state: {e}")
 
-                                            # Action was successful, now update state for main thread
+                                            # 3c. Run Verifier
+                                            if img_before and img_after:
+                                                succeeded = verifier.verify_action(img_before, img_after, action_to_verify)
+                                                if not succeeded:
+                                                    log.warning(f"⚠️ VERIFIER FAILED: Action '{action_to_verify}' did not cause expected change.")                                                   
+                                                    try:
+                                                        ts = time.strftime("%Y%m%d_%H%M%S")
+                                                        filename_before = os.path.join(DEBUG_FOLDER, f"{ts}_{action_to_verify}_before.png")
+                                                        filename_after = os.path.join(DEBUG_FOLDER, f"{ts}_{action_to_verify}_after.png")
+                                                        
+                                                        img_before.save(filename_before)
+                                                        img_after.save(filename_after)
+                                                        log.info(f"Saved debug screenshots: {filename_before} | {filename_after}")
+                                                    except Exception as e:
+                                                        log.error(f"Failed to save debug screenshots: {e}")
+
+                                                    agent.report_visual_failure(game_state_before, action_to_verify)
+                                                else:
+                                                    log.info(f"✅ VERIFIER SUCCESS: Action '{action_to_verify}' caused a change.")
+                                            else:
+                                                log.warning("Verifier: Skipping, missing 'before' or 'after' image.")
+
+
                                             new_step_count = current_step_count + 1
                                             new_agent_time = time.time()
                                             
-                                            # Put final result on queue for main thread
                                             agent_result_queue.put(('success', result, new_step_count, new_agent_time))
 
-                                            # 3b. Sync and Checkpoint (Still in background thread)
                                             try:
                                                 from utils.llm_logger import get_llm_logger
                                                 client_llm_logger = get_llm_logger()
@@ -417,7 +466,7 @@ def run_multiprocess_client(server_port=8000, args=None):
                                                 checkpoint_response = requests.post(
                                                     f"{server_url}/checkpoint",
                                                     json={"step_count": new_step_count},
-                                                    timeout=10  # This 10s block is now safely in the background
+                                                    timeout=10
                                                 )
                                                 
                                                 history_response = requests.post(

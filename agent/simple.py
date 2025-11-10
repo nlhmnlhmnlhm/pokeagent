@@ -14,6 +14,7 @@ Key improvements over the original simple mode:
 - Chain of thought reasoning with structured LLM responses
 - Objectives system with automatic and manual completion tracking
 - Dynamic goal setting and progress monitoring
+- A* Pathfinding integration with PATHFIND(X,Y) command
 
 The agent maintains objectives (go to location, battle trainer, etc.) that are
 automatically tracked and marked complete when achieved. The LLM can also
@@ -33,14 +34,16 @@ Configuration defaults (can be customized):
 import logging
 import os
 import sys
+import re
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Union
 import numpy as np
 from PIL import Image
 
 from utils.state_formatter import format_state_for_llm
+from utils.pathfinding import Pathfinder
 # from utils.agent_helpers import update_server_metrics TODO 
 
 logger = logging.getLogger(__name__)
@@ -88,6 +91,7 @@ class Objective:
     progress_notes: str = ""
     storyline: bool = False  # True for main storyline objectives (auto-verified), False for agent sub-objectives
     milestone_id: Optional[str] = None  # Emulator milestone ID for storyline objectives
+    custom_hint: Optional[str] = None
 
 @dataclass
 class HistoryEntry:
@@ -112,6 +116,8 @@ class SimpleAgentState:
     failed_movements: Dict[str, List[str]] = field(default_factory=dict)  # coord_key -> [failed_directions]
     npc_interactions: Dict[str, str] = field(default_factory=dict)  # coord_key -> interaction_notes
     movement_memory_action_counter: int = 0  # Counter for tracking actions since last memory clear
+    current_path: List[str] = field(default_factory=list) # 
+    last_reasoning: str = ""
     
     def __post_init__(self):
         """Initialize deques with current default values"""
@@ -151,6 +157,9 @@ class SimpleAgent:
         # Initialize storyline objectives for Emerald progression
         self._initialize_storyline_objectives()
         
+        # Initialize the pathfinder
+        self.pathfinder = Pathfinder()
+        
     def _initialize_storyline_objectives(self):
         """Initialize the main storyline objectives for Pokémon Emerald progression"""
         storyline_objectives = [
@@ -163,10 +172,11 @@ class SimpleAgent:
             },
             {
                 "id": "story_intro_complete",
-                "description": "Complete intro cutscene with moving van",
+                "description": "Complete intro cutscene then move outside the van",
                 "objective_type": "cutscene",
                 "target_value": "Intro Complete",
-                "milestone_id": "INTRO_CUTSCENE_COMPLETE"
+                "milestone_id": "INTRO_CUTSCENE_COMPLETE",
+                "custom_hint" : "Try alterning START with A if you are stuck. To escape the van, use directional buttons (UP, DOWN, LEFT, RIGHT)."
             },
             {
                 "id": "story_player_house",
@@ -182,13 +192,25 @@ class SimpleAgent:
                 "target_value": "Player's Bedroom",
                 "milestone_id": "PLAYER_BEDROOM"
             },
+            
             {
-                "id": "story_clock_set",
-                "description": "Set the clock on the wall in the player's bedroom. Interact with the clock (5,1) by pressing A while facing it. Then, leave the house.",
-                "objective_type": "location",
-                "target_value": "Clock Set",
-                "milestone_id": "CLOCK_SET"
+                "id": "story_set_clock",
+                "description": "Set the clock on the wall in your bedroom. Interact with the clock (at coords 5,1) by pressing A while facing it.",
+                "objective_type": "custom",
+                "target_value": "Set Clock",
+                "completed": False,
+                "storyline": False,
+                "milestone_id": None
             },
+            {
+                "id": "story_leave_house",
+                "description": "After setting the clock, go downstairs and leave your house to explore Littleroot Town.",
+                "objective_type": "location",
+                "target_value": "Leave House",
+                "storyline": True, # This is the storyline objective
+                "milestone_id": "CLOCK_SET" # This milestone triggers when you are *outside*
+            },
+            
             {
                 "id": "story_rival_house",
                 "description": "Visit May's house next door",
@@ -338,10 +360,11 @@ class SimpleAgent:
                 description=obj_data["description"],
                 objective_type=obj_data["objective_type"],
                 target_value=obj_data["target_value"],
-                completed=False,
-                progress_notes="Storyline objective - verified by emulator milestones",
-                storyline=True,
-                milestone_id=obj_data["milestone_id"]
+                completed=obj_data.get("completed", False), 
+                progress_notes=obj_data.get("progress_notes", "Storyline objective - verified by emulator milestones"), 
+                storyline=obj_data.get("storyline", True),
+                milestone_id=obj_data["milestone_id"],
+                custom_hint=obj_data.get("custom_hint")
             )
             self.state.objectives.append(objective)
 
@@ -683,12 +706,13 @@ class SimpleAgent:
         frame = game_state.get('frame')
         if frame is None:
             logger.error("🚫 No frame in game_state for SimpleAgent.step")
-            return {"action": "WAIT", "reasoning": "No frame available"}
+            self.state.last_reasoning = "No frame available"
+            return {"action": ["A"], "reasoning": self.state.last_reasoning} # Return list
         
-        action = self.process_step(frame, game_state)
-        return {"action": action, "reasoning": "Simple agent decision"}
+        action_list = self.process_step(frame, game_state)
+        return {"action": action_list, "reasoning": self.state.last_reasoning}
     
-    def process_step(self, frame, game_state: Dict[str, Any]) -> str:
+    def process_step(self, frame, game_state: Dict[str, Any]) -> List[str]:
         """
         Main processing step for simple mode with history tracking
         
@@ -697,29 +721,61 @@ class SimpleAgent:
             game_state: Complete game state dictionary
             
         Returns:
-            Action string or list of actions
+            List of actions
         """
         # CRITICAL: Validate frame before any VLM processing
         if frame is None:
             logger.error("🚫 CRITICAL: SimpleAgent.process_step called with None frame - cannot proceed")
-            return "WAIT"
+            return ["A"]
         
         # Validate frame is a proper image
         if not (hasattr(frame, 'save') or hasattr(frame, 'shape')):
             logger.error(f"🚫 CRITICAL: SimpleAgent.process_step called with invalid frame type {type(frame)} - cannot proceed")
-            return "WAIT"
+            return ["A"]
         
         # Additional PIL Image validation
         if hasattr(frame, 'size'):
             width, height = frame.size
             if width <= 0 or height <= 0:
                 logger.error(f"🚫 CRITICAL: SimpleAgent.process_step called with invalid frame size {width}x{height} - cannot proceed")
-                return "WAIT"
+                return ["A"]
         
         # Check for black frame (transition screen)
         if self.is_black_frame(frame):
             logger.info("⏳ Black frame detected (likely a transition), waiting for next frame...")
-            return "WAIT"  # Return WAIT to skip this frame and wait for the next one
+            return ["A"]  # Return "A" as a safe "wait" action
+        
+        if self.state.current_path:
+            action = self.state.current_path.pop(0)
+            logger.info(f"Executing next pathfinding step: {action}. Remaining: {len(self.state.current_path)}")
+            
+            # We still need to record history for this step
+            coords = self.get_player_coords(game_state)
+            context = self.get_game_context(game_state)
+            map_id = self.get_map_id(game_state)
+            game_state_summary = self.create_game_state_summary(game_state)
+            reasoning = f"Following path. Step: {action}. Remaining: {len(self.state.current_path) + 1}"
+            self.state.last_reasoning = reasoning
+            
+            history_entry = HistoryEntry(
+                timestamp=datetime.now(),
+                player_coords=coords,
+                map_id=map_id,
+                context=context,
+                action_taken=f"PATHFIND_STEP: {action} | Reasoning: {reasoning}",
+                game_state_summary=game_state_summary
+            )
+            self.state.history.append(history_entry)
+            self.state.recent_actions.append(action)
+            self.state.movement_memory_action_counter += 1
+            
+            # Check if we should clear movement memory
+            if (self.movement_memory_clear_interval > 0 and 
+                self.state.movement_memory_action_counter >= self.movement_memory_clear_interval):
+                logger.info(f"🧹 Movement memory clear triggered after {self.state.movement_memory_action_counter} actions")
+                self.clear_movement_memory(partial=True)
+            
+            return [action] # Return as a list of one action
         
         try:
             # Increment step counter
@@ -753,7 +809,19 @@ class SimpleAgent:
             active_objectives = self.get_active_objectives()
             completed_objectives_list = self.get_completed_objectives()
             objectives_summary = self._format_objectives_for_llm(active_objectives, completed_objectives_list)
+            # Find the custom hint for the current stage
+            current_hint = ""
+            for obj in active_objectives:
+                if hasattr(obj, 'custom_hint') and obj.custom_hint:
+                    current_hint = obj.custom_hint
+                    break  # Use the hint from the first active objective that has one
             
+            hint_section = ""
+            if current_hint:
+                hint_section = f"""
+💡 CURRENT STAGE HINT:
+{current_hint}
+"""
             # Build pathfinding rules section (only if not in title sequence)
             pathfinding_rules = ""
             if context != "title":
@@ -799,7 +867,7 @@ EXAMPLE - DO THIS INSTEAD:
             Based on the current game frame and state information, think through your next move and choose the best button action. 
             If you notice that you are repeating the same action sequences over and over again, you definitely need to try something different since what you are doing is wrong! Try exploring different new areas or interacting with different NPCs if you are stuck.
             
-
+            
 RECENT ACTION HISTORY (last {self.actions_display_count} actions):
 {recent_actions_str}
 
@@ -809,6 +877,8 @@ LOCATION/CONTEXT HISTORY (last {self.history_display_count} steps):
 CURRENT OBJECTIVES:
 {objectives_summary}
 
+{hint_section}
+
 CURRENT GAME STATE:
 {formatted_state}
 
@@ -816,7 +886,11 @@ CURRENT GAME STATE:
 
 {stuck_warning}
 
-Available actions: A, B, START, SELECT, UP, DOWN, LEFT, RIGHT
+Available actions: A, B, START, SELECT, UP, DOWN, LEFT, RIGHT, PATHFIND(X,Y)
+
+💡 STRATEGIC VARIETY (Try this if you are stuck):
+- If you are in a loop, try a different action.
+- If you are stuck in dialogue, try pressing 'A' or 'B'.
 
 IMPORTANT: Please think step by step before choosing your action. Structure your response like this:
 
@@ -825,10 +899,7 @@ ANALYSIS:
 IMPORTANT: Look carefully at the game image for objects (clocks, pokeballs, bags) and NPCs (people, trainers) that might not be shown on the map. NPCs appear as sprite characters and can block movement or trigger battles/dialogue. When you see them try determine their location (X,Y) on the map relative to the player and any objects.]
 
 OBJECTIVES:
-[Review your current objectives. You have main storyline objectives (story_*) that track overall Emerald progression - these are automatically verified and you CANNOT manually complete them.  There may be sub-objectives that you need to complete before the main milestone. You can create your own sub-objectives to help achieve the main goals. Do any need to be updated, added, or marked as complete?
-- Add sub-objectives: ADD_OBJECTIVE: type:description:target_value (e.g., "ADD_OBJECTIVE: location:Find Pokemon Center in town:(15,20)" or "ADD_OBJECTIVE: item:Buy Pokeballs:5")
-- Complete sub-objectives only: COMPLETE_OBJECTIVE: objective_id:notes (e.g., "COMPLETE_OBJECTIVE: my_sub_obj_123:Successfully bought Pokeballs")
-- NOTE: Do NOT try to complete storyline objectives (story_*) - they auto-complete when milestones are reached]
+[Review your current objectives. You have main storyline objectives (story_*) that track overall Emerald progression.  There may be sub-objectives that you need to complete before the main milestone.
 
 PLAN:
 [Think about your immediate goal - what do you want to accomplish in the next few actions? Consider your current objectives and recent history. 
@@ -838,7 +909,7 @@ REASONING:
 [Explain why you're choosing this specific action. Reference the MOVEMENT PREVIEW and MOVEMENT MEMORY sections. Check the visual frame for NPCs before moving. If you see NPCs in the image, avoid walking into them. Consider any failed movements or known obstacles from your memory.]
 
 ACTION:
-[Your final action choice - PREFER SINGLE ACTIONS like 'RIGHT' or 'A'. Only use multiple actions like 'UP, UP, RIGHT' if you've verified each step is WALKABLE in the movement preview and map.]
+[Your final action choice - PREFER SINGLE ACTIONS like 'RIGHT' or 'A'. Use `PATHFIND(X,Y)` for complex navigation. Only use multiple actions like 'UP, UP, RIGHT' if you've verified each step is WALKABLE in the movement preview and map.]
 
 {pathfinding_rules}
 
@@ -860,6 +931,7 @@ Context: {context} | Coords: {coords} """
             sys.stdout.flush()
             
             # Make VLM call - double-check frame validation before VLM
+            actions = ["A"] # Default fallback
             if frame and (hasattr(frame, 'save') or hasattr(frame, 'shape')):
                 print("🔍 Making VLM call...")
                 try:
@@ -867,13 +939,44 @@ Context: {context} | Coords: {coords} """
                     print(f"🔍 VLM response received: {response[:100]}..." if len(response) > 100 else f"🔍 VLM response: {response}")
                 except Exception as e:
                     print(f"❌ VLM call failed: {e}")
-                    return "WAIT"
+                    self.state.last_reasoning = f"VLM call failed: {e}"
+                    return ["A"]
             else:
                 logger.error("🚫 CRITICAL: About to call VLM but frame validation failed - this should never happen!")
-                return "WAIT"
+                self.state.last_reasoning = "VLM call failed: Invalid frame"
+                return ["A"]
             
-            # Extract action(s) from structured response
-            actions, reasoning = self._parse_structured_response(response, game_state)
+            # Extract command/action(s) and reasoning
+            command_or_actions, reasoning = self._parse_structured_response(response, game_state)
+            self.state.last_reasoning = reasoning # Store reasoning
+            
+            # Handle the extracted command
+            if isinstance(command_or_actions, tuple) and command_or_actions[0] == 'PATHFIND':
+                # It's a pathfinding command
+                _, target_coords = command_or_actions
+                start_coords = self.get_player_coords(game_state)
+                
+                if not start_coords:
+                    logger.warning("PATHFIND failed: Cannot get player's start coordinates.")
+                    actions = ['A'] # Fallback
+                else:
+                    logger.info(f"Calculating path from {start_coords} to {target_coords}...")
+                    # Update pathfinder's collision map
+                    self.pathfinder.collision_map = game_state.get("map", {}) 
+                    path = self.pathfinder.find_path(start_coords, target_coords, game_state)
+                    
+                    if path:
+                        logger.info(f"Path found: {path}")
+                        self.state.current_path = path
+                        action = self.state.current_path.pop(0)
+                        actions = [action]
+                    else:
+                        logger.warning(f"No path found from {start_coords} to {target_coords}. Waiting.")
+                        actions = ['A'] # Fallback
+            
+            else:
+                # It's a regular action list
+                actions = command_or_actions
             
             # Check for failed movement by comparing previous coordinates
             if len(self.state.history) > 0:
@@ -928,12 +1031,15 @@ Context: {context} | Coords: {coords} """
                         self.state.stuck_detection[key] = max(0, self.state.stuck_detection[key] - 1)
             
             # Update server with agent step and metrics (for agent thinking display)
-            update_server_metrics()
+            # update_server_metrics() # TODO: Re-enable this
             
             return actions
             
         except Exception as e:
             logger.error(f"Error in simple agent processing: {e}")
+            import traceback
+            traceback.print_exc()
+            self.state.last_reasoning = f"Error in simple agent processing: {e}"
             return ["A"]  # Default safe action as list
     
     def _parse_actions(self, response: str, game_state: Dict[str, Any] = None) -> List[str]:
@@ -993,7 +1099,7 @@ Context: {context} | Coords: {coords} """
         
         return "\n".join(lines)
     
-    def _parse_structured_response(self, response: str, game_state: Dict[str, Any] = None) -> Tuple[List[str], str]:
+    def _parse_structured_response(self, response: str, game_state: Dict[str, Any] = None) -> Tuple[Union[List[str], Tuple[str, Tuple[int, int]]], str]:
         """Parse structured chain-of-thought response and extract actions and reasoning"""
         try:
             # Extract sections from structured response
@@ -1001,7 +1107,7 @@ Context: {context} | Coords: {coords} """
             objectives_section = ""
             plan = ""
             reasoning = ""
-            actions = []
+            actions: Any = [] # Can be List[str] or Tuple[str, Tuple[int, int]]
             
             # Split response into lines for processing
             lines = response.split('\n')
@@ -1027,8 +1133,16 @@ Context: {context} | Coords: {coords} """
                     current_section = 'action'
                     # Extract actions from this line
                     action_text = line[7:].strip()  # Remove "ACTION:" prefix
-                    if action_text:  # Only parse if there's content
+                    
+                    path_match = re.search(r'PATHFIND\(\s*(\d+)\s*,\s*(\d+)\s*\)', action_text.upper())
+                    if path_match:
+                        x = int(path_match.group(1))
+                        y = int(path_match.group(2))
+                        # Set actions to a special tuple indicating a command
+                        actions = ('PATHFIND', (x, y)) 
+                    elif action_text:  # Only parse if there's content
                         actions = self._parse_actions(action_text, game_state)
+                        
                 elif line and current_section:
                     # Continue content of current section
                     if current_section == 'analysis':
@@ -1039,14 +1153,22 @@ Context: {context} | Coords: {coords} """
                         plan += " " + line
                     elif current_section == 'reasoning':
                         reasoning += " " + line
-                    elif current_section == 'action':
+                    elif current_section == 'action' and not isinstance(actions, tuple): # Don't parse if pathfind already found
                         # Additional action parsing from action section content
-                        if line.strip():  # Only process non-empty lines
-                            additional_actions = self._parse_actions(line, game_state)
-                            actions.extend(additional_actions)
-                            if len(actions) >= 10:  # Max 10 actions
-                                actions = actions[:10]
-                                break
+                        if line.strip():
+                            # Check for pathfind here too
+                            path_match = re.search(r'PATHFIND\(\s*(\d+)\s*,\s*(\d+)\s*\)', line.upper())
+                            if path_match:
+                                x = int(path_match.group(1))
+                                y = int(path_match.group(2))
+                                actions = ('PATHFIND', (x, y))
+                            else:
+                                additional_actions = self._parse_actions(line, game_state)
+                                if isinstance(actions, list):
+                                    actions.extend(additional_actions)
+                                    if len(actions) >= 10:  # Max 10 actions
+                                        actions = actions[:10]
+                                        break
             
             # Process objectives if mentioned
             if objectives_section:
@@ -1054,7 +1176,14 @@ Context: {context} | Coords: {coords} """
             
             # If no actions found in structured format, fall back to parsing entire response
             if not actions:
-                actions = self._parse_actions(response, game_state)
+                # Check response again for pathfind
+                path_match = re.search(r'PATHFIND\(\s*(\d+)\s*,\s*(\d+)\s*\)', response.upper())
+                if path_match:
+                    x = int(path_match.group(1))
+                    y = int(path_match.group(2))
+                    actions = ('PATHFIND', (x, y))
+                else:
+                    actions = self._parse_actions(response, game_state) # This returns List[str]
             
             # Create concise reasoning summary
             reasoning_parts = []
@@ -1112,7 +1241,7 @@ Context: {context} | Coords: {coords} """
                         if success:
                             logger.info(f"LLM manually completed objective: {obj_id}")
                         else:
-                            logger.warning(f"LLM tried to complete non-existent or already completed objective: {obj_id}")
+                            logger.warning(f"LLM tried to complete non-existent, already completed, or storyline objective: {obj_id}")
                         
         except Exception as e:
             logger.warning(f"Error processing objectives from response: {e}")
@@ -1570,7 +1699,20 @@ Context: {context} | Coords: {coords} """
             "movement_memory_clear_interval": self.movement_memory_clear_interval
         }
 
-# Global simple agent instance for backward compatibility with existing multiprocess code
+    def report_visual_failure(self, game_state_before: Dict[str, Any], failed_action: str):
+        """
+        Reports a failed action identified by the external ScreenshotVerifier.
+        This allows the agent to learn from visual feedback, not just coordinate changes.
+        """
+        coords = self.get_player_coords(game_state_before)
+        if not coords:
+            return
+
+        logger.warning(f"Visual verifier reported failure for action '{failed_action}' at {coords}.")
+        
+        if failed_action.upper() in ['UP', 'DOWN', 'LEFT', 'RIGHT']:
+            self.record_failed_movement(coords, failed_action, "visual_no_change")
+
 _global_simple_agent = None
 
 def get_simple_agent(vlm) -> SimpleAgent:
@@ -1621,6 +1763,9 @@ def simple_mode_processing_multiprocess(vlm, game_state, args=None):
     # CRITICAL: Validate frame before processing
     if frame is None:
         logger.error("🚫 CRITICAL: simple_step called with None frame")
-        return "WAIT"
+        return ["A"] # Return list
     
-    return agent.process_step(frame, game_state)
+    # The agent.step method returns a dict {"action": [...], "reasoning": "..."}
+    # This wrapper should just return the action list
+    result_dict = agent.step(game_state)
+    return result_dict.get("action", ["A"])
