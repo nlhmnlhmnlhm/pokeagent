@@ -87,7 +87,7 @@ def run_multiprocess_client(server_port=8000, args=None):
     print(f"✅ Agent initialized")
     print(f"🎮 Client connected to server at {server_url}")
 
-    verifier = ScreenshotVerifier(change_threshold=0.975)
+    verifier = ScreenshotVerifier(change_threshold=0.99)
     
     # Display setup
     headless = args and args.headless

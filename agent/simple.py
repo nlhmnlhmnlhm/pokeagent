@@ -15,6 +15,7 @@ Key improvements over the original simple mode:
 - Objectives system with automatic and manual completion tracking
 - Dynamic goal setting and progress monitoring
 - A* Pathfinding integration with PATHFIND(X,Y) command
+- Randomized conversational focus injected into the main prompt.
 
 The agent maintains objectives (go to location, battle trainer, etc.) that are
 automatically tracked and marked complete when achieved. The LLM can also
@@ -35,6 +36,7 @@ import logging
 import os
 import sys
 import re
+import random
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -47,6 +49,241 @@ from utils.pathfinding import Pathfinder
 # from utils.agent_helpers import update_server_metrics TODO 
 
 logger = logging.getLogger(__name__)
+
+TITLE_FOCUS_VARIATIONS = [
+    "I just loaded the game. What are the first steps to get past the title screen and begin playing?",
+    "I'm stuck on the title screen. How do I initiate the game and start the intro?",
+    "Ready to start! What inputs are necessary to skip the title sequence and begin the journey?",
+    "Need to get off this title page. What's the optimal sequence to advance into the game world?",
+    "The game is at the title. Please advise on the quickest way to reach the main menu/intro.",
+    "First step: bypass the title. What buttons do I need to press to move forward?",
+    "Let's get this show on the road! What action gets me past the title screen?",
+    "What's the required input to begin the game from the current title screen state?",
+    "Can you provide the next button press to start the game?",
+    "Please guide me through the title sequence to the game start."
+]
+
+BATTLE_FOCUS_VARIATIONS = [
+    "I'm in a **BATTLE!** What should I do to win the fight or progress the encounter?",
+    "We're in a pinch! Recommend the most effective battle action for this turn.",
+    "Quick! What action will maximize my advantage in this current battle?",
+    "The fight is on. What single action should I execute now?",
+    "Focus on the battle. Provide the optimal button press to gain control or attack.",
+    "What is the required action to continue or win the current Pokémon battle?",
+    "Need advice on this battle. What action do you recommend for the current turn?",
+    "My focus is battle. Tell me the best immediate input.",
+    "How do I progress or complete this Pokémon battle sequence?"
+]
+
+MENU_FOCUS_VARIATIONS = [
+    "I'm in a menu. How should I navigate to achieve my current objective?",
+    "The menu is active. What sequence of moves or selection should I use?",
+    "What input is required to move through this menu and continue?",
+    "Guide my menu navigation. What's the next action to take?",
+    "I need to close or utilize this menu. What is the priority button press?",
+    "Analyze the menu state. What's the best immediate action?",
+    "Current state is a menu. Advise on the navigational button for progression.",
+    "What action should I use to exit or select an item from the current menu?",
+    "Need to move forward from this menu. What is the necessary input?"
+]
+
+STUCK_FOCUS_VARIATIONS = [
+    "I'm stuck! What's the best way to get out of this spot?",
+    "The stuck pattern is active. We need to reflect. Let's observe the frame. Should I try a single action ?",
+    "I'm caught in a loop! What do you see on the frame ?",
+    "Stuck detection fired. What single action should I use? ",
+    "My movement is blocked or repeating. What successful unitary action is required now?",
+    "The agent thinks I'm stuck. Let's force a change. What single, safe step is available?",
+]
+
+DEFAULT_FOCUS_VARIATIONS = [
+    "Advise on movement: which direction should I head for progress?",
+    "The game is waiting for input. What is the most productive next action?",
+    "What is the best immediate action to take based on the current map and objectives?"
+]
+
+
+def format_prompt_objectives_for_llm(active_objectives: List[Any], completed_objectives: List[Any]) -> str:
+    """Formats objectives for the structured ACTION PLAN block."""
+    lines = []
+    
+    if active_objectives:
+        lines.append("🎯 ACTIVE OBJECTIVES:")
+        # Use .description, .objective_type, etc. assuming 'Any' is an Objective object
+        for i, obj in enumerate(active_objectives[:5], 1):
+            target_str = f" (Target: {obj.target_value})" if obj.target_value else ""
+            lines.append(f"  {i}. [{obj.objective_type}] {obj.description}{target_str} [ID: {obj.id}]")
+    else:
+        lines.append("🎯 ACTIVE OBJECTIVES: None - Consider setting some goals!")
+    
+    if completed_objectives:
+        recent_completed = completed_objectives[-3:]
+        lines.append("✅ RECENTLY COMPLETED:")
+        for obj in recent_completed:
+            lines.append(f"  ✓ [{obj.objective_type}] {obj.description}")
+    
+    return "\n".join(lines)
+
+def get_conversational_focus(context: str, stuck_warning: str, objectives_summary: str) -> str:
+    """Selects a random conversational focus based on game context and state."""
+    if context == "title":
+        return random.choice(TITLE_FOCUS_VARIATIONS)
+    elif context == "battle":
+        return random.choice(BATTLE_FOCUS_VARIATIONS)
+    elif context == "menu":
+        return random.choice(MENU_FOCUS_VARIATIONS)
+    elif "WARNING" in stuck_warning:
+        return random.choice(STUCK_FOCUS_VARIATIONS)
+    elif not objectives_summary.strip().endswith("None - Consider setting some goals!"):
+        return random.choice(DEFAULT_FOCUS_VARIATIONS).replace("find a new objective", "achieve my current objectives")
+    else:
+        return random.choice(DEFAULT_FOCUS_VARIATIONS)
+
+def build_conversational_prompt(
+    formatted_state: str,
+    history_summary: str,
+    recent_actions_str: str,
+    objectives_summary: str,
+    movement_memory: str,
+    stuck_warning: str,
+    context: str,
+    coords: Optional[Tuple[int, int]],
+    history_display_count: int,
+    actions_display_count: int, 
+    current_story_hint: str = ""
+) -> str:
+    """
+    Constructs the full prompt with a conversational wrapper based on the agent's state.
+    """
+    
+    conversational_focus = get_conversational_focus(context, stuck_warning, objectives_summary)
+    
+    pathfinding_rules = """
+🚨 PATHFINDING RULES:
+1. **SCREENSHOT OVER CONTEXT OR COORDS**: Sometimes the user could miss something important. Be sure to check user's screenshot first.
+2. **SINGLE STEP FIRST**: Always prefer single actions (UP, DOWN, LEFT, RIGHT, A, B) for short distances or complex, immediate interactions.
+3. **NO BLIND CHAINS**: Never chain multiple basic moves (e.g., RIGHT, RIGHT, RIGHT) if any intermediate tile is not confirmed WALKABLE in the MOVEMENT PREVIEW.
+"""
+    
+    full_prompt = f"""You are 'PokéGuide', an intelligent AI assistant helping the player, the Protagonist, progress through Pokémon Emerald. 
+Your primary function is to analyze the game state and recommend the next best action.
+
+--- AGENT INTERFACE ---
+
+{formatted_state}
+
+USER QUESTION/FOCUS:
+{conversational_focus}
+
+RECENT ACTION HISTORY (last {actions_display_count} actions):
+{recent_actions_str}
+
+LOCATION/CONTEXT HISTORY (last {history_display_count} steps):
+{history_summary}
+
+CURRENT OBJECTIVES:
+{objectives_summary}
+
+{current_story_hint}
+{movement_memory}
+
+{stuck_warning}
+
+Available actions: A, B, START, SELECT, UP, DOWN, LEFT, RIGHT
+
+IMPORTANT: Please structure your response as follows to be parsed correctly.
+
+--- RESPONSE START ---
+
+CHAT MESSAGE: [Start your conversational message here.]
+
+ANALYSIS:
+[Analyze what you see in the frame and current game state. Look for objects (clocks, pokeballs, bags) and NPCs (people, trainers) in the visual frame that might not be on the map.]
+
+OBJECTIVES:
+[Review objectives. Use ADD_OBJECTIVE:type:description:target_value or COMPLETE_OBJECTIVE:objective_id:notes for non-storyline goals.]
+
+PLAN:
+[Think about your immediate strategy.]
+
+REASONING:
+[Justification for the chosen ACTION, referencing the MOVEMENT PREVIEW, MOVEMENT MEMORY, or visual frame observations.]
+
+ACTION:
+[The final action choice - PREFER SINGLE ACTIONS.]
+
+{pathfinding_rules} 
+
+"""
+    return full_prompt
+
+def parse_llm_response(response: str, game_state: Dict[str, Any]) -> Tuple[List[str], str, str, str, str]:
+    """
+    Parses the structured LLM response into actions and structured reasoning components.
+    Returns: actions, full_reasoning, chat_message, objectives_section, action_text
+    """
+    
+    analysis = ""
+    objectives_section = ""
+    plan = ""
+    reasoning = ""
+    action_text = ""
+    chat_message = ""
+    
+    lines = response.split('\n')
+    current_section = None
+    
+    for line in lines:
+        line = line.strip()
+        
+        if line.upper().startswith('CHAT MESSAGE:'):
+            current_section = 'chat_message'
+            chat_message = line[13:].strip()
+        elif line.upper().startswith('ANALYSIS:'):
+            current_section = 'analysis'
+            analysis = line[9:].strip()
+        elif line.upper().startswith('OBJECTIVES:'):
+            current_section = 'objectives'
+            objectives_section = line[11:].strip()
+        elif line.upper().startswith('PLAN:'):
+            current_section = 'plan'
+            plan = line[5:].strip()
+        elif line.upper().startswith('REASONING:'):
+            current_section = 'reasoning'
+            reasoning = line[10:].strip()
+        elif line.upper().startswith('ACTION:'):
+            current_section = 'action'
+            action_text = line[7:].strip()
+        elif line and current_section:
+            if current_section == 'chat_message':
+                chat_message += " " + line
+            elif current_section == 'analysis':
+                analysis += " " + line
+            elif current_section == 'objectives':
+                objectives_section += " " + line
+            elif current_section == 'plan':
+                plan += " " + line
+            elif current_section == 'reasoning':
+                reasoning += " " + line
+            elif current_section == 'action':
+                action_text += " " + line
+
+    reasoning_parts = []
+    if analysis:
+        reasoning_parts.append(f"Analysis: {analysis.strip()}")
+    if objectives_section:
+        reasoning_parts.append(f"Objectives: {objectives_section.strip()}")
+    if plan:
+        reasoning_parts.append(f"Plan: {plan.strip()}")
+    if reasoning:
+        reasoning_parts.append(f"Reasoning: {reasoning.strip()}")
+    
+    full_reasoning = " | ".join(reasoning_parts) if reasoning_parts else "No structured reasoning provided"
+    
+    return [], full_reasoning, chat_message.strip(), objectives_section.strip(), action_text.strip()
+
+# --- END: Integrated Conversational Prompts ---
+
 
 # Configurable parameters for history tracking
 DEFAULT_MAX_HISTORY_ENTRIES = 100  # Previous states/locations with context
@@ -176,14 +413,15 @@ class SimpleAgent:
                 "objective_type": "cutscene",
                 "target_value": "Intro Complete",
                 "milestone_id": "INTRO_CUTSCENE_COMPLETE",
-                "custom_hint" : "Try alterning START with A if you are stuck. To escape the van, use directional buttons (UP, DOWN, LEFT, RIGHT)."
+                "custom_hint": "You need to validate the button at the naming screen."
             },
             {
                 "id": "story_player_house",
                 "description": "Enter player's house for the first time",
                 "objective_type": "location",
                 "target_value": "Player's House",
-                "milestone_id": "PLAYER_HOUSE_ENTERED"
+                "milestone_id": "PLAYER_HOUSE_ENTERED",
+                "custom_hint" : "Use only (UP, DOWN, LEFT, RIGHT) to escape the van."
             },
             {
                 "id": "story_player_bedroom",
@@ -192,31 +430,28 @@ class SimpleAgent:
                 "target_value": "Player's Bedroom",
                 "milestone_id": "PLAYER_BEDROOM"
             },
-            
             {
                 "id": "story_set_clock",
-                "description": "Set the clock on the wall in your bedroom. Interact with the clock (at coords 5,1) by pressing A while facing it.",
-                "objective_type": "custom",
+                "description": "Set the clock on the wall in your bedroom. Interact with the clock (at coords 5,1) by pressing A while facing it, then leave the house.",
+                "objective_type": "location",
                 "target_value": "Set Clock",
                 "completed": False,
                 "storyline": False,
-                "milestone_id": None
+                "milestone_id": None,            
             },
             {
                 "id": "story_leave_house",
                 "description": "After setting the clock, go downstairs and leave your house to explore Littleroot Town.",
                 "objective_type": "location",
                 "target_value": "Leave House",
-                "storyline": True, # This is the storyline objective
                 "milestone_id": "CLOCK_SET" # This milestone triggers when you are *outside*
             },
-            
             {
                 "id": "story_rival_house",
                 "description": "Visit May's house next door",
                 "objective_type": "location",
                 "target_value": "Rival's House",
-                "milestone_id": "RIVAL_HOUSE"
+                "milestone_id": "RIVAL_HOUSE",
             },
             {
                 "id": "story_rival_bedroom",
@@ -230,14 +465,14 @@ class SimpleAgent:
                 "description": "Travel north to Route 101 and encounter Prof. Birch",
                 "objective_type": "location",
                 "target_value": "Route 101",
-                "milestone_id": "ROUTE_101"
+                "milestone_id": "ROUTE_101",
             },
             {
                 "id": "story_starter_chosen",
                 "description": "Choose starter Pokémon and receive first party member",
                 "objective_type": "pokemon",
                 "target_value": "Starter Pokémon",
-                "milestone_id": "STARTER_CHOSEN"
+                "milestone_id": "STARTER_CHOSEN",
             },
             {
                 "id": "story_birch_lab",
@@ -251,15 +486,15 @@ class SimpleAgent:
                 "description": "Leave lab and continue journey north to Oldale Town",
                 "objective_type": "location",
                 "target_value": "Oldale Town",
-                "milestone_id": "OLDALE_TOWN"
+                "milestone_id": "OLDALE_TOWN",
             },
             {
                 "id": "story_route_103",
                 "description": "Travel to Route 103 to meet rival",
                 "objective_type": "location",
                 "target_value": "Route 103",
-                "milestone_id": "ROUTE_103"
-            },
+                "milestone_id": "ROUTE_103",
+            },            
             {
                 "id": "story_received_pokedex",
                 "description": "Return to Birch's lab and receive the Pokédex",
@@ -279,8 +514,9 @@ class SimpleAgent:
                 "description": "Navigate to Petalburg City and visit Dad's gym",
                 "objective_type": "location",
                 "target_value": "Petalburg City",
-                "milestone_id": "PETALBURG_CITY"
+                "milestone_id": "PETALBURG_CITY",
             },
+            
             {
                 "id": "story_dad_meeting",
                 "description": "Meet Dad at Petalburg City Gym",
@@ -302,20 +538,24 @@ class SimpleAgent:
                 "target_value": "Route 104 South",
                 "milestone_id": "ROUTE_104_SOUTH"
             },
+            
+            # --- START: ADDED HANDCRAFTED HINTS ---
             {
                 "id": "story_petalburg_woods",
                 "description": "Navigate through Petalburg Woods to help Devon researcher",
                 "objective_type": "location",
                 "target_value": "Petalburg Woods",
-                "milestone_id": "PETALBURG_WOODS"
+                "milestone_id": "PETALBURG_WOODS",
             },
             {
                 "id": "story_aqua_grunt",
                 "description": "Defeat Team Aqua Grunt in Petalburg Woods",
                 "objective_type": "battle",
                 "target_value": "Aqua Grunt Defeated",
-                "milestone_id": "TEAM_AQUA_GRUNT_DEFEATED"
+                "milestone_id": "TEAM_AQUA_GRUNT_DEFEATED",
             },
+            # --- END: ADDED HANDCRAFTED HINTS ---
+            
             {
                 "id": "story_route_104_north",
                 "description": "Travel through northern section of Route 104 to Rustboro",
@@ -330,13 +570,17 @@ class SimpleAgent:
                 "target_value": "Rustboro City",
                 "milestone_id": "RUSTBORO_CITY"
             },
+            
+            # --- START: ADDED HANDCRAFTED HINTS ---
             {
                 "id": "story_rustboro_gym",
                 "description": "Enter the Rustboro Gym and challenge Roxanne",
                 "objective_type": "location",
                 "target_value": "Rustboro Gym",
-                "milestone_id": "RUSTBORO_GYM_ENTERED"
+                "milestone_id": "RUSTBORO_GYM_ENTERED",
             },
+            # --- END: ADDED HANDCRAFTED HINTS ---
+            
             {
                 "id": "story_roxanne_defeated",
                 "description": "Defeat Gym Leader Roxanne",
@@ -490,8 +734,16 @@ class SimpleAgent:
         for obj in self.get_active_objectives():
             should_complete = False
             notes = ""
-            
-            if obj.objective_type == "location" and coords and obj.target_value:
+            if obj.id == "story_set_clock" and coords == (5, 2):
+                if len(self.state.recent_actions) >= 3:
+                    # Get the last 3 actions from the deque
+                    last_three_actions = list(self.state.recent_actions)[-3:]
+                    
+                    # Check if they match the required sequence
+                    if last_three_actions == ['A', 'UP', 'A']:
+                        should_complete = True
+                        notes = f"Player at {coords} and in '{context}' context; detected clock interaction."                
+            elif obj.objective_type == "location" and coords and obj.target_value:
                 # Check if player reached target location
                 # Note: target_value is a string (location name) for storyline objectives
                 # Location objectives are completed via milestone verification, not coordinate checking
@@ -646,7 +898,10 @@ class SimpleAgent:
         summary_lines = []
         for i, entry in enumerate(recent_entries, 1):
             coord_str = f"({entry.player_coords[0]},{entry.player_coords[1]})" if entry.player_coords else "(?)"
-            summary_lines.append(f"{i}. {entry.context} at {coord_str}: {entry.action_taken}")
+            # Simplify history entry to avoid showing full reasoning
+            action_part = entry.action_taken.split("|")[0].strip()
+            
+            summary_lines.append(f"{i}. {entry.context} at {coord_str}: {action_part}")
         
         return "\n".join(summary_lines)
     
@@ -710,7 +965,12 @@ class SimpleAgent:
             return {"action": ["A"], "reasoning": self.state.last_reasoning} # Return list
         
         action_list = self.process_step(frame, game_state)
-        return {"action": action_list, "reasoning": self.state.last_reasoning}
+        
+        # Return in the expected format, reading the stored reasoning
+        return {
+            "action": action_list, 
+            "reasoning": self.state.last_reasoning
+        }
     
     def process_step(self, frame, game_state: Dict[str, Any]) -> List[str]:
         """
@@ -726,11 +986,13 @@ class SimpleAgent:
         # CRITICAL: Validate frame before any VLM processing
         if frame is None:
             logger.error("🚫 CRITICAL: SimpleAgent.process_step called with None frame - cannot proceed")
+            self.state.last_reasoning = "Critical error: No frame."
             return ["A"]
         
         # Validate frame is a proper image
         if not (hasattr(frame, 'save') or hasattr(frame, 'shape')):
             logger.error(f"🚫 CRITICAL: SimpleAgent.process_step called with invalid frame type {type(frame)} - cannot proceed")
+            self.state.last_reasoning = f"Critical error: Invalid frame type {type(frame)}."
             return ["A"]
         
         # Additional PIL Image validation
@@ -738,11 +1000,13 @@ class SimpleAgent:
             width, height = frame.size
             if width <= 0 or height <= 0:
                 logger.error(f"🚫 CRITICAL: SimpleAgent.process_step called with invalid frame size {width}x{height} - cannot proceed")
+                self.state.last_reasoning = f"Critical error: Invalid frame size {width}x{height}."
                 return ["A"]
         
         # Check for black frame (transition screen)
         if self.is_black_frame(frame):
             logger.info("⏳ Black frame detected (likely a transition), waiting for next frame...")
+            self.state.last_reasoning = "Black frame detected, waiting."
             return ["A"]  # Return "A" as a safe "wait" action
         
         if self.state.current_path:
@@ -755,6 +1019,7 @@ class SimpleAgent:
             map_id = self.get_map_id(game_state)
             game_state_summary = self.create_game_state_summary(game_state)
             reasoning = f"Following path. Step: {action}. Remaining: {len(self.state.current_path) + 1}"
+            
             self.state.last_reasoning = reasoning
             
             history_entry = HistoryEntry(
@@ -805,10 +1070,15 @@ class SimpleAgent:
             stuck_warning = self.get_stuck_warning(coords, context, game_state)
             recent_actions_str = ', '.join(list(self.state.recent_actions)[-self.actions_display_count:]) if self.state.recent_actions else 'None'
             
-            # Format objectives for LLM
+            # --- START: REVERTED & MODIFIED PROMPT GENERATION ---
+            
+            # Format objectives for LLM (using the new imported function)
             active_objectives = self.get_active_objectives()
             completed_objectives_list = self.get_completed_objectives()
-            objectives_summary = self._format_objectives_for_llm(active_objectives, completed_objectives_list)
+            
+            # Use the new module-level function
+            objectives_summary = format_prompt_objectives_for_llm(active_objectives, completed_objectives_list)
+
             # Find the custom hint for the current stage
             current_hint = ""
             for obj in active_objectives:
@@ -822,7 +1092,10 @@ class SimpleAgent:
 💡 CURRENT STAGE HINT:
 {current_hint}
 """
-            # Build pathfinding rules section (only if not in title sequence)
+            # --- NEW: Get randomized focus ---
+            conversational_focus = get_conversational_focus(context, stuck_warning, objectives_summary)
+
+            # --- NEW: Pathfinding rules (from original) ---
             pathfinding_rules = ""
             if context != "title":
                 pathfinding_rules = """
@@ -862,62 +1135,67 @@ EXAMPLE - DO THIS INSTEAD:
 - NPCs can trigger battles or dialogue, which may be useful for objectives
 """
 
-            # Create enhanced prompt with objectives, history context and chain of thought request
-            prompt = f"""You are playing as the Protagonist in Pokemon Emerald. Progress quickly to the milestones by balancing exploration and exploitation of things you know. 
+            # --- REVERTED: Original prompt structure ---
+            prompt = f"""You are 'PokéGuide', an intelligent AI assistant helping the player, the Protagonist, progress through Pokémon Emerald.
             Based on the current game frame and state information, think through your next move and choose the best button action. 
-            If you notice that you are repeating the same action sequences over and over again, you definitely need to try something different since what you are doing is wrong! Try exploring different new areas or interacting with different NPCs if you are stuck.
+            If you notice that you are repeating the same action sequences over and over again, you definitely need to try something different! Try exploring different new areas or interacting with different NPCs if you are stuck.
             
+            --- CURRENT FOCUS ---
+            {conversational_focus}
+            --- END FOCUS ---
             
-RECENT ACTION HISTORY (last {self.actions_display_count} actions):
-{recent_actions_str}
+            RECENT ACTION HISTORY (last {self.actions_display_count} actions):
+            {recent_actions_str}
 
-LOCATION/CONTEXT HISTORY (last {self.history_display_count} steps):
-{history_summary}
+            LOCATION/CONTEXT HISTORY (last {self.history_display_count} steps):
+            {history_summary}
 
-CURRENT OBJECTIVES:
-{objectives_summary}
+            CURRENT OBJECTIVES:
+            {objectives_summary}
 
-{hint_section}
+            {hint_section}
 
-CURRENT GAME STATE:
-{formatted_state}
+            CURRENT GAME STATE:
+            {formatted_state}
 
-{movement_memory}
+            {movement_memory}
 
-{stuck_warning}
+            {stuck_warning}
 
-Available actions: A, B, START, SELECT, UP, DOWN, LEFT, RIGHT, PATHFIND(X,Y)
+            Available actions: A, B, START, SELECT, UP, DOWN, LEFT, RIGHT, PATHFIND(X,Y)
 
-💡 STRATEGIC VARIETY (Try this if you are stuck):
-- If you are in a loop, try a different action.
-- If you are stuck in dialogue, try pressing 'A' or 'B'.
+            💡 STRATEGIC VARIETY (Try this if you are stuck):
+            - If you are in a loop, try a different action.
+            - If you are stuck in dialogue, try pressing 'A' or 'B'.
 
-IMPORTANT: Please think step by step before choosing your action. Structure your response like this:
+            IMPORTANT: Please think step by step before choosing your action. Structure your response like this:
 
-ANALYSIS:
-[Analyze what you see in the frame and current game state - what's happening? where are you? what should you be doing? 
-IMPORTANT: Look carefully at the game image for objects (clocks, pokeballs, bags) and NPCs (people, trainers) that might not be shown on the map. NPCs appear as sprite characters and can block movement or trigger battles/dialogue. When you see them try determine their location (X,Y) on the map relative to the player and any objects.]
+            ANALYSIS:
+            [Analyze what you see in the frame and current game state - what's happening? where are you? what should you be doing? 
+            IMPORTANT: Look carefully at the game image for objects (clocks, pokeballs, bags) and NPCs (people, trainers) that might not be shown on the map. NPCs appear as sprite characters and can block movement or trigger battles/dialogue. When you see them try determine their location (X,Y) on the map relative to the player and any objects.]
 
-OBJECTIVES:
-[Review your current objectives. You have main storyline objectives (story_*) that track overall Emerald progression.  There may be sub-objectives that you need to complete before the main milestone.
+            OBJECTIVES:
+            [Review your current objectives. You have main storyline objectives (story_*) that track overall Emerald progression.  There may be sub-objectives that you need to complete before the main milestone. Use ADD_OBJECTIVE:type:description:target_value or COMPLETE_OBJECTIVE:objective_id:notes for non-storyline goals.]
 
-PLAN:
-[Think about your immediate goal - what do you want to accomplish in the next few actions? Consider your current objectives and recent history. 
-Check MOVEMENT MEMORY for areas you've had trouble with before and plan your route accordingly.]
+            PLAN:
+            [Think about your immediate goal - what do you want to accomplish in the next few actions? Consider your current objectives and recent history. 
+            Check MOVEMENT MEMORY for areas you've had trouble with before and plan your route accordingly.]
 
-REASONING:
-[Explain why you're choosing this specific action. Reference the MOVEMENT PREVIEW and MOVEMENT MEMORY sections. Check the visual frame for NPCs before moving. If you see NPCs in the image, avoid walking into them. Consider any failed movements or known obstacles from your memory.]
+            REASONING:
+            [Explain why you're choosing this specific action. Reference the MOVEMENT PREVIEW and MOVEMENT MEMORY sections. Check the visual frame for NPCs before moving. If you see NPCs in the image, avoid walking into them. Consider any failed movements or known obstacles from your memory.]
 
-ACTION:
-[Your final action choice - PREFER SINGLE ACTIONS like 'RIGHT' or 'A'. Use `PATHFIND(X,Y)` for complex navigation. Only use multiple actions like 'UP, UP, RIGHT' if you've verified each step is WALKABLE in the movement preview and map.]
+            ACTION:
+            [Your final action choice - PREFER SINGLE ACTIONS like 'RIGHT' or 'A'. Use `PATHFIND(X,Y)` for complex navigation. Only use multiple actions like 'UP, UP, RIGHT' if you've verified each step is WALKABLE in the movement preview and map.]
 
-{pathfinding_rules}
+            {pathfinding_rules}
 
-Context: {context} | Coords: {coords} """
+            Context: {context} | Coords: {coords} """
+            
+            # --- END: REVERTED & MODIFIED PROMPT GENERATION ---
             
             # Print complete prompt to terminal for debugging
             print("\n" + "="*120)
-            print("🤖 SIMPLE AGENT PROMPT SENT TO VLM:")
+            print("🤖 SIMPLE AGENT PROMPT SENT TO VLM (Old Format + Randomized Focus):") # Modified print
             print("="*120)
             
             # Print prompt in chunks to avoid terminal truncation
@@ -946,9 +1224,9 @@ Context: {context} | Coords: {coords} """
                 self.state.last_reasoning = "VLM call failed: Invalid frame"
                 return ["A"]
             
-            # Extract command/action(s) and reasoning
             command_or_actions, reasoning = self._parse_structured_response(response, game_state)
-            self.state.last_reasoning = reasoning # Store reasoning
+            
+            self.state.last_reasoning = reasoning # Store structured reasoning            
             
             # Handle the extracted command
             if isinstance(command_or_actions, tuple) and command_or_actions[0] == 'PATHFIND':
@@ -994,7 +1272,11 @@ Context: {context} | Coords: {coords} """
 
             # Record this step in history with reasoning
             game_state_summary = self.create_game_state_summary(game_state)
+            
+            # --- REVERTED HISTORY ENTRY ---
             action_with_reasoning = f"{actions} | Reasoning: {reasoning}" if reasoning else str(actions)
+            # --- END REVERTED HISTORY ENTRY ---
+            
             history_entry = HistoryEntry(
                 timestamp=datetime.now(),
                 player_coords=coords,
@@ -1080,7 +1362,11 @@ Context: {context} | Coords: {coords} """
         return actions_found
     
     def _format_objectives_for_llm(self, active_objectives: List[Objective], completed_objectives: List[Objective]) -> str:
-        """Format objectives for LLM consumption"""
+        """
+        Format objectives for LLM consumption.
+        NOTE: This is the AGENT's internal version. The PROMPT now uses format_prompt_objectives_for_llm.
+        This function is kept in case other agent methods rely on it.
+        """
         lines = []
         
         if active_objectives:
@@ -1100,7 +1386,10 @@ Context: {context} | Coords: {coords} """
         return "\n".join(lines)
     
     def _parse_structured_response(self, response: str, game_state: Dict[str, Any] = None) -> Tuple[Union[List[str], Tuple[str, Tuple[int, int]]], str]:
-        """Parse structured chain-of-thought response and extract actions and reasoning"""
+        """
+        Parse structured chain-of-thought response and extract actions and reasoning
+        (This is the original parser)
+        """
         try:
             # Extract sections from structured response
             analysis = ""
@@ -1407,10 +1696,17 @@ Context: {context} | Coords: {coords} """
                         
                         # Extract action from response
                         action_taken = "UNKNOWN"
+                        reasoning = ""
+
+                        # This now only checks for the old format
                         if "ACTION:" in response:
+                            # Old format
                             action_section = response.split("ACTION:")[-1].strip()
                             action_line = action_section.split('\n')[0].strip()
                             action_taken = action_line
+                            if "REASONING:" in response:
+                                reasoning_section = response.split("REASONING:")[-1].split("ACTION:")[0].strip()
+                                reasoning = reasoning_section
                         
                         # Parse timestamp
                         timestamp = datetime.now()
@@ -1425,12 +1721,7 @@ Context: {context} | Coords: {coords} """
                         if coords:
                             game_state_summary += f" | Context: {context}"
                         
-                        # Add reasoning summary
-                        reasoning = ""
-                        if "REASONING:" in response:
-                            reasoning_section = response.split("REASONING:")[-1].split("ACTION:")[0].strip()
-                            reasoning = reasoning_section
-                        
+                        # REVERTED
                         action_with_reasoning = f"{action_taken} | Reasoning: {reasoning}" if reasoning else action_taken
                         
                         # Create history entry

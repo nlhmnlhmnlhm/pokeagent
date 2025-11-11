@@ -1231,9 +1231,9 @@ class PokemonEmeraldReader:
             
             # Check for dialog but respect A button clearing
             # Use cached dialogue state if available, otherwise fall back to detection
-            cached_active, _ = self.get_cached_dialogue_state()
-            if cached_active:
-                return "dialog"
+            # cached_active, _ = self.get_cached_dialogue_state()
+            # if cached_active:
+            #     return "dialog"
             
             return "overworld"
         except Exception as e:

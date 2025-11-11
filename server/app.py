@@ -869,7 +869,7 @@ async def get_comprehensive_state():
         # Use the same cached dialog state as the status endpoint
         is_dialog = env._cached_dialog_state if env else False
         if is_dialog:
-            state["game"]["game_state"] = "dialog"
+            state["game"]["game_state"] = "overworld"
         else:
             # Force overworld if not in dialog (respect 5-second timeout)
             state["game"]["game_state"] = "overworld"

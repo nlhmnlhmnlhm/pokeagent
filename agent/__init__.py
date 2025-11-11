@@ -115,6 +115,21 @@ class Agent:
                 print(f"❌ Agent error: {e}")
                 return None
 
+    def report_visual_failure(self, game_state_before, failed_action):
+        """
+        Passes a visual failure report to the underlying agent implementation.
+        
+        Args:
+            game_state_before: The game state before the failed action.
+            failed_action: The action that was reported as failed.
+        """
+        # Only SimpleAgent implements this
+        if self.scaffold == "simple" and hasattr(self.agent_impl, 'report_visual_failure'):
+            self.agent_impl.report_visual_failure(game_state_before, failed_action)
+        else:
+            # 'fourmodule' scaffold doesn't use this, so we can ignore
+            pass
+
 
 __all__ = [
     'Agent',

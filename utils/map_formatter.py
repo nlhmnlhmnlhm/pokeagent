@@ -308,7 +308,8 @@ def format_map_for_display(raw_tiles, title="Map", npcs=None, player_coords=None
     else:
         player_coords_tuple = player_coords
     
-    grid = format_map_grid(raw_tiles, player_facing, npcs, player_coords_tuple)
+    # grid = format_map_grid(raw_tiles, player_facing, npcs, player_coords_tuple)
+    grid = format_map_grid(raw_tiles, npcs=npcs, player_coords=player_coords, location_name=location_name)
     
     lines = [f"{title} ({len(grid)}x{len(grid[0])}):", ""]
     
@@ -447,7 +448,8 @@ def format_map_for_llm(raw_tiles, player_facing="South", npcs=None, player_coord
     if not raw_tiles:
         return "No map data available"
 
-    grid = format_map_grid(raw_tiles, player_facing, npcs, player_coords, location_name=location_name)
+    # grid = format_map_grid(raw_tiles, player_facing, npcs, player_coords, location_name=location_name)
+    grid = format_map_grid(raw_tiles, npcs=npcs, player_coords=player_coords)
 
     # Simple grid format for LLM
     lines = []

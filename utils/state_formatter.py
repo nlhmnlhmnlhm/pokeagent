@@ -941,7 +941,7 @@ def _add_local_map_fallback(context_parts, map_info, include_npcs, location_name
         context_parts.append(map_display)
         
         # Add dynamic legend based on symbols in the map
-        grid = format_map_grid(raw_tiles, facing, npcs, player_coords, location_name=location_name)
+        grid = format_map_grid(raw_tiles, npcs=npcs, player_coords=player_coords, location_name=location_name)
         legend = generate_dynamic_legend(grid)
         context_parts.append(f"\n{legend}")
 
