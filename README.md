@@ -1,11 +1,6 @@
 ## Pokéagent 
 
-- [x] Run ``--scaffold simple`` and set `trim_padding` to `false`
-- [x] Fix popup error 
-- [ ] Fix HTTPConnexionError 
-- [ ] Add a new module feedback loop to inform the agent whether an action succeeded
-- [ ] Add pathfinding to `simple.py`
-- [ ] Add variety to prompts
+Fork of [this](https://github.com/sethkarten/pokeagent-speedrun) repo : https://github.com/sethkarten/pokeagent-speedrun
 
 ### Setup
 
