@@ -1,6 +1,13 @@
 ## Pokéagent 
 
-Fork of [this](https://github.com/sethkarten/pokeagent-speedrun) repo : https://github.com/sethkarten/pokeagent-speedrun
+Fork of [Seth Karten's Pokeagent Speedrun repo](https://github.com/sethkarten/pokeagent-speedrun)
+
+### Results
+
+A screenshot verifier that flags ineffective moves, a "threaded" client, per-objective hints, randomized prompts, a scripted clock objective, and a map-formatting fix. Try to implement A* pathfinding via PATHFIND(X,Y) which do not work.
+
+![Agent playing Pokémon Emerald](img/leaderboard_11.png)
+
 
 ### Setup
 
